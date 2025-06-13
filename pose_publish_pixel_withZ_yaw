@@ -1,0 +1,215 @@
+#!/usr/bin/env python
+
+import cv2
+import numpy as np
+import rospy
+import tf
+from geometry_msgs.msg import PoseStamped
+from franka_msgs.msg import FrankaState
+import math
+
+# ==============================================================================
+# === ROS & CONTROL PARAMETERS (TUNE THESE) ===
+# ==============================================================================
+
+CONTROL_TOPIC = '/cartesian_impedance_example_controller/equilibrium_pose'
+
+# --- XY Control ---
+PIXEL_TO_METER_GAIN = 0.0005
+
+# --- Z Control ---
+AREA_TO_METER_GAIN = 0.000002
+
+# --- Yaw Control (NEW) ---
+# Converts orientation error (in radians) to a robot yaw command.
+YAW_GAIN = 0.5  # Radians of robot motion per radian of image error
+
+# --- Smoothing ---
+SMOOTHING_FACTOR_XY = 0.1
+SMOOTHING_FACTOR_Z = 0.07
+SMOOTHING_FACTOR_YAW = 0.1 # NEW
+
+# --- Safety (NEW) ---
+# The absolute minimum Z coordinate (in the panda_link0 frame) the robot is allowed to go to.
+Z_SAFETY_LIMIT = 0.05 # 5 cm
+
+# ==============================================================================
+# === PHYSICAL & CAMERA PARAMETERS (SET THESE ONCE) ===
+# ==============================================================================
+
+CAMERA_MATRIX = np.array([[1.40650756e+03, 0.00000000e+00, 9.67004759e+02],
+                          [0.00000000e+00, 1.40809873e+03, 5.55713591e+02],
+                          [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]], dtype=np.float32)
+DIST_COEFFS = np.array([[0.09617148, -0.1634111, 0.00022246, -0.00056651, -0.00507073]], dtype=np.float32)
+CAMERA_INDEX = 0
+
+# ==============================================================================
+# === CORE LOGIC (GENERALLY DO NOT NEED TO EDIT BELOW THIS LINE) ===
+# ==============================================================================
+
+target_pose_msg = PoseStamped()
+initial_pose_position = None
+initial_pose_orientation = None
+initial_euler_angles = None
+target_pixel_area = None
+
+smoothed_command_xy_m = np.array([0.0, 0.0])
+smoothed_command_z_m = 0.0
+smoothed_command_yaw_rad = 0.0 # NEW
+
+# NEW: Global variable to store the robot's current Z position from the subscriber
+current_robot_z = None
+
+def franka_state_callback(msg):
+    """
+    NEW: ROS subscriber callback to continuously update the robot's current Z position.
+    """
+    global current_robot_z
+    current_robot_z = msg.O_T_EE[14]
+
+def detect_aruco_properties(frame):
+    """
+    Detects ArUco marker and returns its corners, center, and area.
+    MODIFIED: Now returns the raw corners for orientation calculation.
+    """
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+    parameters = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+    corners, ids, _ = detector.detectMarkers(frame)
+
+    if ids is not None:
+        marker_corners = corners[0].reshape((4, 2))
+        centerX = int(np.mean(marker_corners[:, 0]))
+        centerY = int(np.mean(marker_corners[:, 1]))
+        area = cv2.contourArea(marker_corners)
+        return marker_corners, centerX, centerY, area
+
+    return None, None, None, None
+
+def init_ros_and_robot_state(cap):
+    """
+    Initializes ROS, robot state, target area, and the new Franka state subscriber.
+    """
+    global target_pose_msg, initial_pose_position, initial_pose_orientation, initial_euler_angles, target_pixel_area
+
+    rospy.init_node('aruco_full_3d_controller', anonymous=True)
+    pub = rospy.Publisher(CONTROL_TOPIC, PoseStamped, queue_size=1)
+    
+    # NEW: Subscriber for the Z-axis safety limit
+    rospy.Subscriber("franka_state_controller/franka_states", FrankaState, franka_state_callback)
+
+    print("Waiting for initial Franka state...")
+    current_state = rospy.wait_for_message("franka_state_controller/franka_states", FrankaState)
+    print("Franka state received.")
+
+    initial_pose_position = np.array([current_state.O_T_EE[12], current_state.O_T_EE[13], current_state.O_T_EE[14]])
+    initial_pose_orientation = tf.transformations.quaternion_from_matrix(
+        np.transpose(np.reshape(current_state.O_T_EE, (4, 4))))
+    initial_pose_orientation /= np.linalg.norm(initial_pose_orientation)
+    # NEW: Store initial roll, pitch, yaw for yaw control
+    initial_euler_angles = tf.transformations.euler_from_quaternion(initial_pose_orientation)
+
+    print("Detecting ArUco marker to set target Z-distance...")
+    ret, frame = cap.read()
+    if not ret: rospy.logerr("Cannot read from camera during init."); exit()
+    
+    _, _, _, initial_area = detect_aruco_properties(frame)
+    if initial_area is None: rospy.logerr("Could not find ArUco marker during init."); exit()
+
+    target_pixel_area = initial_area
+    print(f"Marker detected. Target area set to: {target_pixel_area:.2f} pixels^2")
+
+    target_pose_msg.header.frame_id = "panda_link0"
+    print(f"Initialization complete. Robot starting at: {initial_pose_position}")
+    return pub
+
+def process_frame(frame, pub):
+    """
+    Main processing pipeline: calculates and publishes XYZ and Yaw commands.
+    """
+    global smoothed_command_xy_m, smoothed_command_z_m, smoothed_command_yaw_rad
+
+    height, width, _ = frame.shape
+    image_center_x, image_center_y = width // 2, height // 2
+
+    marker_corners, marker_center_x, marker_center_y, marker_area = detect_aruco_properties(frame)
+
+    if marker_corners is not None:
+        # --- 1. XY Control ---
+        error_x = marker_center_x - image_center_x
+        error_y = marker_center_y - image_center_y
+        raw_cmd_xy = np.array([-error_y * PIXEL_TO_METER_GAIN, -error_x * PIXEL_TO_METER_GAIN])
+        smoothed_command_xy_m = SMOOTHING_FACTOR_XY * raw_cmd_xy + (1 - SMOOTHING_FACTOR_XY) * smoothed_command_xy_m
+        target_pose_msg.pose.position.x = initial_pose_position[0] + smoothed_command_xy_m[0]
+        target_pose_msg.pose.position.y = initial_pose_position[1] + smoothed_command_xy_m[1]
+
+        # --- 2. Z Control ---
+        area_error = marker_area - target_pixel_area
+        raw_cmd_z = -area_error * AREA_TO_METER_GAIN
+        smoothed_command_z_m = SMOOTHING_FACTOR_Z * raw_cmd_z + (1 - SMOOTHING_FACTOR_Z) * smoothed_command_z_m
+        commanded_z = initial_pose_position[2] + smoothed_command_z_m
+        # NEW: Apply Z-axis safety limit
+        target_pose_msg.pose.position.z = max(commanded_z, Z_SAFETY_LIMIT)
+
+        # --- 3. Yaw Control (NEW) ---
+        topLeft, topRight = marker_corners[0], marker_corners[1]
+        dx = topRight[0] - topLeft[0]
+        dy = topRight[1] - topLeft[1]
+        marker_angle_rad = math.atan2(dy, dx) # Angle of marker's top edge
+        raw_cmd_yaw = -marker_angle_rad * YAW_GAIN # Error is the angle itself, goal is 0
+        smoothed_command_yaw_rad = SMOOTHING_FACTOR_YAW * raw_cmd_yaw + (1 - SMOOTHING_FACTOR_YAW) * smoothed_command_yaw_rad
+        
+        # Add the yaw command to the initial yaw
+        target_roll = initial_euler_angles[0]
+        target_pitch = initial_euler_angles[1]
+        target_yaw = initial_euler_angles[2] + smoothed_command_yaw_rad
+        target_quat = tf.transformations.quaternion_from_euler(target_roll, target_pitch, target_yaw)
+        target_pose_msg.pose.orientation.x = target_quat[0]
+        target_pose_msg.pose.orientation.y = target_quat[1]
+        target_pose_msg.pose.orientation.z = target_quat[2]
+        target_pose_msg.pose.orientation.w = target_quat[3]
+
+        # --- 4. PUBLISHING ---
+        target_pose_msg.header.stamp = rospy.Time.now()
+        pub.publish(target_pose_msg)
+        
+        # --- 5. VISUALIZATION ---
+        # Draw on frame
+        cv2.polylines(frame, [marker_corners.astype(np.int32)], True, (0, 255, 0), 2)
+        cv2.circle(frame, (marker_center_x, marker_center_y), 4, (0, 0, 255), -1)
+        cv2.line(frame, tuple(topLeft.astype(int)), tuple(topRight.astype(int)), (255, 200, 0), 3) # Yaw indicator
+
+        # Console output
+        print("\033c", end="")
+        print(f"--- Z-AXIS --- Curr Z: {current_robot_z:.3f} | Target Z: {target_pose_msg.pose.position.z:.3f}", end="")
+        if target_pose_msg.pose.position.z <= Z_SAFETY_LIMIT + 0.001: print(" (LIMIT ACTIVE)")
+        else: print("")
+        print(f"--- YAW ------ Angle Err: {math.degrees(marker_angle_rad):.1f} deg | Cmd dYaw: {math.degrees(smoothed_command_yaw_rad):.1f} deg")
+        print("---------------------------------------------")
+
+    cv2.circle(frame, (image_center_x, image_center_y), 5, (255, 0, 0), -1)
+    cv2.imshow("ArUco 3D+Yaw Control", frame)
+
+
+if __name__ == '__main__':
+    try:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened(): rospy.logerr(f"Cannot open camera at index {CAMERA_INDEX}."); exit()
+        
+        control_pub = init_ros_and_robot_state(cap)
+
+        print("\nStarting control loop. Press 'q' in the OpenCV window to quit.")
+        while not rospy.is_shutdown():
+            ret, frame = cap.read()
+            if not ret: rospy.logwarn("Failed to grab frame."); continue
+
+            process_frame(frame, control_pub)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+    except rospy.ROSInterruptException: pass
+    except Exception as e: rospy.logerr(f"An unexpected error occurred: {e}")
+    finally:
+        print("\nShutting down.")
+        cap.release()
+        cv2.destroyAllWindows()
