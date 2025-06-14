@@ -12,8 +12,9 @@ Two solutions are implemented in this repository
     Arguments need to be passed for running the calibration.py to be run. The commands for each of it is:
 
     python calibration.py --dir <directory_to_folder_of_images> --square_size <square_size>
-
     You can find more details on other parameters using python calibration.py --help
+
+    NOTE: the cammera and distortion coefficients need to be chaned based on the pose_estimation_plot.py and pose_estimation_pub.py.
     
 2. using pixel coordinates of the detected marker and use the area of the marker for estimating depth.
 
