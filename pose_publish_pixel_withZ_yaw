@@ -20,18 +20,20 @@ PIXEL_TO_METER_GAIN = 0.0005
 # --- Z Control ---
 AREA_TO_METER_GAIN = 0.000002
 
-# --- Yaw Control (NEW) ---
+# --- Yaw Control ---
 # Converts orientation error (in radians) to a robot yaw command.
 YAW_GAIN = 0.5  # Radians of robot motion per radian of image error
 
 # --- Smoothing ---
 SMOOTHING_FACTOR_XY = 0.1
 SMOOTHING_FACTOR_Z = 0.07
-SMOOTHING_FACTOR_YAW = 0.1 # NEW
+SMOOTHING_FACTOR_YAW = 0.1
 
-# --- Safety (NEW) ---
+# --- Safety ---
 # The absolute minimum Z coordinate (in the panda_link0 frame) the robot is allowed to go to.
 Z_SAFETY_LIMIT = 0.05 # 5 cm
+# NEW: The absolute maximum Z coordinate (in the panda_link0 frame) the robot is allowed to go to.
+Z_MAX_LIMIT = 0.6 # 60 cm
 
 # ==============================================================================
 # === PHYSICAL & CAMERA PARAMETERS (SET THESE ONCE) ===
@@ -55,14 +57,14 @@ target_pixel_area = None
 
 smoothed_command_xy_m = np.array([0.0, 0.0])
 smoothed_command_z_m = 0.0
-smoothed_command_yaw_rad = 0.0 # NEW
+smoothed_command_yaw_rad = 0.0
 
-# NEW: Global variable to store the robot's current Z position from the subscriber
+# Global variable to store the robot's current Z position from the subscriber
 current_robot_z = None
 
 def franka_state_callback(msg):
     """
-    NEW: ROS subscriber callback to continuously update the robot's current Z position.
+    ROS subscriber callback to continuously update the robot's current Z position.
     """
     global current_robot_z
     current_robot_z = msg.O_T_EE[14]
@@ -70,7 +72,6 @@ def franka_state_callback(msg):
 def detect_aruco_properties(frame):
     """
     Detects ArUco marker and returns its corners, center, and area.
-    MODIFIED: Now returns the raw corners for orientation calculation.
     """
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
     parameters = cv2.aruco.DetectorParameters()
@@ -88,14 +89,13 @@ def detect_aruco_properties(frame):
 
 def init_ros_and_robot_state(cap):
     """
-    Initializes ROS, robot state, target area, and the new Franka state subscriber.
+    Initializes ROS, robot state, target area, and the Franka state subscriber.
     """
     global target_pose_msg, initial_pose_position, initial_pose_orientation, initial_euler_angles, target_pixel_area
 
     rospy.init_node('aruco_full_3d_controller', anonymous=True)
     pub = rospy.Publisher(CONTROL_TOPIC, PoseStamped, queue_size=1)
     
-    # NEW: Subscriber for the Z-axis safety limit
     rospy.Subscriber("franka_state_controller/franka_states", FrankaState, franka_state_callback)
 
     print("Waiting for initial Franka state...")
@@ -106,7 +106,6 @@ def init_ros_and_robot_state(cap):
     initial_pose_orientation = tf.transformations.quaternion_from_matrix(
         np.transpose(np.reshape(current_state.O_T_EE, (4, 4))))
     initial_pose_orientation /= np.linalg.norm(initial_pose_orientation)
-    # NEW: Store initial roll, pitch, yaw for yaw control
     initial_euler_angles = tf.transformations.euler_from_quaternion(initial_pose_orientation)
 
     print("Detecting ArUco marker to set target Z-distance...")
@@ -148,10 +147,12 @@ def process_frame(frame, pub):
         raw_cmd_z = -area_error * AREA_TO_METER_GAIN
         smoothed_command_z_m = SMOOTHING_FACTOR_Z * raw_cmd_z + (1 - SMOOTHING_FACTOR_Z) * smoothed_command_z_m
         commanded_z = initial_pose_position[2] + smoothed_command_z_m
-        # NEW: Apply Z-axis safety limit
-        target_pose_msg.pose.position.z = max(commanded_z, Z_SAFETY_LIMIT)
+        
+        # MODIFIED: Apply both min and max Z-axis safety limits by clamping the value
+        final_commanded_z = min(max(commanded_z, Z_SAFETY_LIMIT), Z_MAX_LIMIT)
+        target_pose_msg.pose.position.z = final_commanded_z
 
-        # --- 3. Yaw Control (NEW) ---
+        # --- 3. Yaw Control ---
         topLeft, topRight = marker_corners[0], marker_corners[1]
         dx = topRight[0] - topLeft[0]
         dy = topRight[1] - topLeft[1]
@@ -159,7 +160,6 @@ def process_frame(frame, pub):
         raw_cmd_yaw = -marker_angle_rad * YAW_GAIN # Error is the angle itself, goal is 0
         smoothed_command_yaw_rad = SMOOTHING_FACTOR_YAW * raw_cmd_yaw + (1 - SMOOTHING_FACTOR_YAW) * smoothed_command_yaw_rad
         
-        # Add the yaw command to the initial yaw
         target_roll = initial_euler_angles[0]
         target_pitch = initial_euler_angles[1]
         target_yaw = initial_euler_angles[2] + smoothed_command_yaw_rad
@@ -174,16 +174,20 @@ def process_frame(frame, pub):
         pub.publish(target_pose_msg)
         
         # --- 5. VISUALIZATION ---
-        # Draw on frame
         cv2.polylines(frame, [marker_corners.astype(np.int32)], True, (0, 255, 0), 2)
         cv2.circle(frame, (marker_center_x, marker_center_y), 4, (0, 0, 255), -1)
-        cv2.line(frame, tuple(topLeft.astype(int)), tuple(topRight.astype(int)), (255, 200, 0), 3) # Yaw indicator
+        cv2.line(frame, tuple(topLeft.astype(int)), tuple(topRight.astype(int)), (255, 200, 0), 3)
 
-        # Console output
+        # MODIFIED: Console output with better status for Z limits
         print("\033c", end="")
-        print(f"--- Z-AXIS --- Curr Z: {current_robot_z:.3f} | Target Z: {target_pose_msg.pose.position.z:.3f}", end="")
-        if target_pose_msg.pose.position.z <= Z_SAFETY_LIMIT + 0.001: print(" (LIMIT ACTIVE)")
-        else: print("")
+        z_status_message = ""
+        # Check if either limit is active (with a small tolerance)
+        if final_commanded_z <= Z_SAFETY_LIMIT + 0.001:
+            z_status_message = " (MIN Z LIMIT ACTIVE)"
+        elif final_commanded_z >= Z_MAX_LIMIT - 0.001:
+            z_status_message = " (MAX Z LIMIT ACTIVE)"
+
+        print(f"--- Z-AXIS --- Curr Z: {current_robot_z:.3f} | Target Z: {final_commanded_z:.3f}{z_status_message}")
         print(f"--- YAW ------ Angle Err: {math.degrees(marker_angle_rad):.1f} deg | Cmd dYaw: {math.degrees(smoothed_command_yaw_rad):.1f} deg")
         print("---------------------------------------------")
 
